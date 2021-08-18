@@ -8,7 +8,11 @@ from argparse import ArgumentParser
 from pprint import pprint
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.loggers import WandbLogger
+
 import os
+
+wandb_logger = WandbLogger(project="graphormer_orig")
 
 
 def cli_main():
@@ -33,7 +37,7 @@ def cli_main():
     # ------------
     # model
     # ------------
-    if args.checkpoint_path != '':
+    if args.checkpoint_path != "":
         model = Graphormer.load_from_checkpoint(
             args.checkpoint_path,
             strict=False,
@@ -79,27 +83,29 @@ def cli_main():
         )
     if not args.test and not args.validate:
         print(model)
-    print('total params:', sum(p.numel() for p in model.parameters()))
+    print("total params:", sum(p.numel() for p in model.parameters()))
 
     # ------------
     # training
     # ------------
-    metric = 'valid_' + get_dataset(dm.dataset_name)['metric']
-    dirpath = args.default_root_dir + f'/lightning_logs/checkpoints'
+    metric = "valid_" + get_dataset(dm.dataset_name)["metric"]
+    dirpath = args.default_root_dir + f"/lightning_logs/checkpoints"
     checkpoint_callback = ModelCheckpoint(
         monitor=metric,
         dirpath=dirpath,
-        filename=dm.dataset_name + '-{epoch:03d}-{' + metric + ':.4f}',
+        filename=dm.dataset_name + "-{epoch:03d}-{" + metric + ":.4f}",
         save_top_k=100,
-        mode=get_dataset(dm.dataset_name)['metric_mode'],
+        mode=get_dataset(dm.dataset_name)["metric_mode"],
         save_last=True,
     )
-    if not args.test and not args.validate and os.path.exists(dirpath + '/last.ckpt'):
-        args.resume_from_checkpoint = dirpath + '/last.ckpt'
-        print('args.resume_from_checkpoint', args.resume_from_checkpoint)
+    if not args.test and not args.validate and os.path.exists(dirpath + "/last.ckpt"):
+        args.resume_from_checkpoint = dirpath + "/last.ckpt"
+        print("args.resume_from_checkpoint", args.resume_from_checkpoint)
+
+    args.logger = wandb_logger
     trainer = pl.Trainer.from_argparse_args(args)
     trainer.callbacks.append(checkpoint_callback)
-    trainer.callbacks.append(LearningRateMonitor(logging_interval='step'))
+    trainer.callbacks.append(LearningRateMonitor(logging_interval="step"))
 
     if args.test:
         result = trainer.test(model, datamodule=dm)
@@ -111,5 +117,5 @@ def cli_main():
         trainer.fit(model, datamodule=dm)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     cli_main()
