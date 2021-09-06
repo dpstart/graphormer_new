@@ -8,6 +8,9 @@ import math
 import torch.nn as nn
 import pytorch_lightning as pl
 
+from utils.fastformer import FastformerAttention
+
+
 from utils.flag import flag_bounded
 
 
@@ -206,7 +209,7 @@ class Graphormer(pl.LightningModule):
         # transfomrer encoder
         output = self.input_dropout(graph_node_feature)
         for enc_layer in self.layers:
-            output = enc_layer(output, graph_attn_bias, mask=None) # TODO readd mask as adj
+            output = enc_layer(output, graph_attn_bias, mask=adj)
         output = self.final_ln(output)
 
         # output part
@@ -406,61 +409,6 @@ class FeedForwardNetwork(nn.Module):
         return x
 
 
-class MultiHeadAttention(nn.Module):
-    def __init__(self, hidden_size, attention_dropout_rate, num_heads):
-        super(MultiHeadAttention, self).__init__()
-
-        self.num_heads = num_heads
-
-        self.att_size = att_size = hidden_size // num_heads
-        self.scale = att_size ** -0.5
-
-        self.linear_q = nn.Linear(hidden_size, num_heads * att_size)
-        self.linear_k = nn.Linear(hidden_size, num_heads * att_size)
-        self.linear_v = nn.Linear(hidden_size, num_heads * att_size)
-        self.att_dropout = nn.Dropout(attention_dropout_rate)
-
-        self.output_layer = nn.Linear(num_heads * att_size, hidden_size)
-
-    def forward(self, q, k, v, attn_bias=None, mask=None):
-        orig_q_size = q.size()
-
-        d_k = self.att_size
-        d_v = self.att_size
-        batch_size = q.size(0)
-
-        # head_i = Attention(Q(W^Q)_i, K(W^K)_i, V(W^V)_i)
-        q = self.linear_q(q).view(batch_size, -1, self.num_heads, d_k)
-        k = self.linear_k(k).view(batch_size, -1, self.num_heads, d_k)
-        v = self.linear_v(v).view(batch_size, -1, self.num_heads, d_v)
-
-        q = q.transpose(1, 2)  # [b, h, q_len, d_k]
-        v = v.transpose(1, 2)  # [b, h, v_len, d_v]
-        k = k.transpose(1, 2).transpose(2, 3)  # [b, h, d_k, k_len]
-
-        # Scaled Dot-Product Attention.
-        # Attention(Q, K, V) = softmax((QK^T)/sqrt(d_k))V
-        q = q * self.scale
-        x = torch.matmul(q, k)  # [b, h, q_len, k_len]
-        if attn_bias is not None:
-            x = x + attn_bias
-        if mask is not None:
-            mask = mask.unsqueeze(1)
-            x = x.masked_fill(mask, 0)
-
-        x = torch.softmax(x, dim=3)
-        x = self.att_dropout(x)
-        x = x.matmul(v)  # [b, h, q_len, attn]
-
-        x = x.transpose(1, 2).contiguous()  # [b, q_len, h, attn]
-        x = x.view(batch_size, -1, self.num_heads * d_v)
-
-        x = self.output_layer(x)
-
-        assert x.size() == orig_q_size
-        return x
-
-
 class EncoderLayer(nn.Module):
     def __init__(
         self, hidden_size, ffn_size, dropout_rate, attention_dropout_rate, num_heads
@@ -468,8 +416,8 @@ class EncoderLayer(nn.Module):
         super(EncoderLayer, self).__init__()
 
         self.self_attention_norm = nn.LayerNorm(hidden_size)
-        self.self_attention = MultiHeadAttention(
-            hidden_size, attention_dropout_rate, num_heads
+        self.self_attention = FastformerAttention(
+            dim=hidden_size, decode_dim=hidden_size
         )
         self.self_attention_dropout = nn.Dropout(dropout_rate)
 
@@ -478,8 +426,9 @@ class EncoderLayer(nn.Module):
         self.ffn_dropout = nn.Dropout(dropout_rate)
 
     def forward(self, x, attn_bias=None, mask=None):
+
         y = self.self_attention_norm(x)
-        y = self.self_attention(y, y, y, attn_bias, mask=mask)
+        y = self.self_attention(y)
         y = self.self_attention_dropout(y)
         x = x + y
 

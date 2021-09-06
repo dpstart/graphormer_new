@@ -8,6 +8,13 @@ import math
 import torch.nn as nn
 import pytorch_lightning as pl
 
+from transformers.models.big_bird.modeling_big_bird import (
+    BigBirdBlockSparseAttention,
+    BigBirdModel,
+)
+
+from transformers.models.big_bird.configuration_big_bird import BigBirdConfig
+
 from utils.flag import flag_bounded
 
 
@@ -206,7 +213,7 @@ class Graphormer(pl.LightningModule):
         # transfomrer encoder
         output = self.input_dropout(graph_node_feature)
         for enc_layer in self.layers:
-            output = enc_layer(output, graph_attn_bias, mask=None) # TODO readd mask as adj
+            output = enc_layer(output, graph_attn_bias, mask=adj)
         output = self.final_ln(output)
 
         # output part
@@ -467,10 +474,13 @@ class EncoderLayer(nn.Module):
     ):
         super(EncoderLayer, self).__init__()
 
+        config = BigBirdConfig()
+        config.block_size = 4
+        config.hidden_size = 80
+        config.num_attention_heads = 8
+
         self.self_attention_norm = nn.LayerNorm(hidden_size)
-        self.self_attention = MultiHeadAttention(
-            hidden_size, attention_dropout_rate, num_heads
-        )
+        self.self_attention = BigBirdBlockSparseAttention(config=config)
         self.self_attention_dropout = nn.Dropout(dropout_rate)
 
         self.ffn_norm = nn.LayerNorm(hidden_size)
@@ -478,9 +488,23 @@ class EncoderLayer(nn.Module):
         self.ffn_dropout = nn.Dropout(dropout_rate)
 
     def forward(self, x, attn_bias=None, mask=None):
+
+        past_key_values_length = 0
+        attention_mask = torch.ones(
+            ((x.size(0), x.size(1) + past_key_values_length)), device="cuda"
+        )
+
+        (
+            blocked_encoder_mask,
+            band_mask,
+            from_mask,
+            to_mask,
+        ) = BigBirdModel.create_masks_for_block_sparse_attn(attention_mask, 4)
         y = self.self_attention_norm(x)
-        y = self.self_attention(y, y, y, attn_bias, mask=mask)
-        y = self.self_attention_dropout(y)
+        y = self.self_attention(
+            y, band_mask=band_mask, from_mask=from_mask, to_mask=to_mask,
+        )
+        y = self.self_attention_dropout(y[0])
         x = x + y
 
         y = self.ffn_norm(x)

@@ -206,7 +206,9 @@ class Graphormer(pl.LightningModule):
         # transfomrer encoder
         output = self.input_dropout(graph_node_feature)
         for enc_layer in self.layers:
-            output = enc_layer(output, graph_attn_bias, mask=None) # TODO readd mask as adj
+            output = enc_layer(
+                output, graph_attn_bias, mask=None
+            )  # TODO readd mask as adj
         output = self.final_ln(output)
 
         # output part
@@ -280,6 +282,12 @@ class Graphormer(pl.LightningModule):
                     mag=self.flag_mag,
                 )
                 self.lr_schedulers().step()
+
+        elif self.dataset_name == "CORA":
+            y_hat = self(batched_data).view(-1)
+            y_gt = batched_data.y.view(-1)
+            train_mask = get_dataset(self.dataset_name).train_mask
+            loss = self.loss_fn(y_hat[train_mask], y_gt[train_mask])
         else:
             y_hat = self(batched_data).view(-1)
             y_gt = batched_data.y.view(-1)
@@ -291,6 +299,11 @@ class Graphormer(pl.LightningModule):
         if self.dataset_name in ["PCQM4M-LSC", "ZINC"]:
             y_pred = self(batched_data).view(-1)
             y_true = batched_data.y.view(-1)
+        elif self.dataset_name == "CORA":
+            y_hat = self(batched_data).view(-1)
+            y_gt = batched_data.y.view(-1)
+            val_mask = get_dataset(self.dataset_name).val_mask
+            loss = self.loss_fn(y_hat[val_mask], y_gt[val_mask])
         else:
             y_pred = self(batched_data)
             y_true = batched_data.y
