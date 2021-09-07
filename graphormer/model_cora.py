@@ -47,26 +47,14 @@ class Graphormer(pl.LightningModule):
         self.save_hyperparameters()
 
         num_virtual_tokens = 1
-
         self.num_heads = num_heads
-        if dataset_name == "ZINC":
-            self.atom_encoder = nn.Embedding(64, hidden_dim, padding_idx=0)
-            self.edge_encoder = nn.Embedding(64, num_heads, padding_idx=0)
-            self.edge_type = edge_type
-            if self.edge_type == "multi_hop":
-                self.edge_dis_encoder = nn.Embedding(40 * num_heads * num_heads, 1)
-            self.rel_pos_encoder = nn.Embedding(40, num_heads, padding_idx=0)
-            self.in_degree_encoder = nn.Embedding(64, hidden_dim, padding_idx=0)
-            self.out_degree_encoder = nn.Embedding(64, hidden_dim, padding_idx=0)
-        else:
-            self.atom_encoder = nn.Embedding(512 * 9 + 1, hidden_dim, padding_idx=0)
-            self.edge_encoder = nn.Embedding(512 * 3 + 1, num_heads, padding_idx=0)
-            self.edge_type = edge_type
-            if self.edge_type == "multi_hop":
-                self.edge_dis_encoder = nn.Embedding(128 * num_heads * num_heads, 1)
-            self.rel_pos_encoder = nn.Embedding(512, num_heads, padding_idx=0)
-            self.in_degree_encoder = nn.Embedding(512, hidden_dim, padding_idx=0)
-            self.out_degree_encoder = nn.Embedding(512, hidden_dim, padding_idx=0)
+
+        self.atom_encoder = nn.Linear(1433, hidden_dim)
+        self.edge_encoder = nn.Linear(1, num_heads)
+        self.edge_type = edge_type
+        self.rel_pos_encoder = nn.Linear(1, num_heads)
+        self.in_degree_encoder = nn.Linear(1, hidden_dim)
+        self.out_degree_encoder = nn.Linear(1, hidden_dim)
 
         self.input_dropout = nn.Dropout(intput_dropout_rate)
         encoders = [
@@ -78,12 +66,9 @@ class Graphormer(pl.LightningModule):
         self.layers = nn.ModuleList(encoders)
         self.final_ln = nn.LayerNorm(hidden_dim)
 
-        if dataset_name == "PCQM4M-LSC":
-            self.out_proj = nn.Linear(hidden_dim, 1)
-        else:
-            self.downstream_out_proj = nn.Linear(
-                hidden_dim, get_dataset(dataset_name)["num_class"]
-            )
+        self.downstream_out_proj = nn.Linear(
+            hidden_dim, get_dataset(dataset_name)["num_class"]
+        )
 
         self.graph_token = nn.Embedding(num_virtual_tokens, hidden_dim)
         self.graph_token_virtual_distance = nn.Embedding(num_virtual_tokens, num_heads)
@@ -116,10 +101,13 @@ class Graphormer(pl.LightningModule):
             batched_data.rel_pos,
             batched_data.x,
         )
-        in_degree, out_degree = batched_data.in_degree, batched_data.in_degree
+        in_degree, out_degree = (
+            batched_data.in_degree.float(),
+            batched_data.in_degree.float(),
+        )
         edge_input, attn_edge_type = (
-            batched_data.edge_input,
-            batched_data.attn_edge_type,
+            batched_data.edge_input.float(),
+            batched_data.attn_edge_type.float(),
         )
         adj = batched_data.adj
 
@@ -132,7 +120,9 @@ class Graphormer(pl.LightningModule):
 
         # rel pos
         # [n_graph, n_node, n_node, n_head] -> [n_graph, n_head, n_node, n_node]
-        rel_pos_bias = self.rel_pos_encoder(rel_pos).permute(0, 3, 1, 2)
+        rel_pos_bias = self.rel_pos_encoder(rel_pos.float().unsqueeze(-1)).permute(
+            0, 3, 1, 2
+        )
         graph_attn_bias[:, :, num_virtual_tokens:, num_virtual_tokens:] = (
             graph_attn_bias[:, :, num_virtual_tokens:, num_virtual_tokens:]
             + rel_pos_bias
@@ -140,54 +130,18 @@ class Graphormer(pl.LightningModule):
         # reset rel pos here
         t = self.graph_token_virtual_distance.weight.view(
             1, self.num_heads, num_virtual_tokens
-        ).unsqueeze(
-            -2
-        )  # [1,8,2]
+        ).unsqueeze(-2)
         self.graph_token_virtual_distance.weight.view(
             1, self.num_heads, num_virtual_tokens
         ).unsqueeze(-2)
         graph_attn_bias[:, :, num_virtual_tokens:, :num_virtual_tokens] = (
-            graph_attn_bias[:, :, num_virtual_tokens:, :num_virtual_tokens]
-            + t  # [256, 8, 35, 2]
+            graph_attn_bias[:, :, num_virtual_tokens:, :num_virtual_tokens] + t
         )
-        # graph_attn_bias[:, :, :num_virtual_tokens, :] = (
-        #     graph_attn_bias[:, :, :num_virtual_tokens, :] + t
-        # )
 
-        # edge feature
-        if self.edge_type == "multi_hop":
-            rel_pos_ = rel_pos.clone()
-            rel_pos_[rel_pos_ == 0] = 1  # set pad to 1
-            # set 1 to 1, x > 1 to x - 1
-            rel_pos_ = torch.where(rel_pos_ > 1, rel_pos_ - 1, rel_pos_)
-            if self.multi_hop_max_dist > 0:
-                rel_pos_ = rel_pos_.clamp(0, self.multi_hop_max_dist)
-                edge_input = edge_input[:, :, :, : self.multi_hop_max_dist, :]
-            # [n_graph, n_node, n_node, max_dist, n_head]
-            edge_input = self.edge_encoder(edge_input).mean(-2)
-            max_dist = edge_input.size(-2)
-            edge_input_flat = edge_input.permute(3, 0, 1, 2, 4).reshape(
-                max_dist, -1, self.num_heads
-            )
-            edge_input_flat = torch.bmm(
-                edge_input_flat,
-                self.edge_dis_encoder.weight.reshape(
-                    -1, self.num_heads, self.num_heads
-                )[:max_dist, :, :],
-            )
-            edge_input = edge_input_flat.reshape(
-                max_dist, n_graph, n_node, n_node, self.num_heads
-            ).permute(1, 2, 3, 0, 4)
-            edge_input = (
-                edge_input.sum(-2) / (rel_pos_.float().unsqueeze(-1))
-            ).permute(0, 3, 1, 2)
-        else:
-            # [n_graph, n_node, n_node, n_head] -> [n_graph, n_head, n_node, n_node]
-            edge_input = self.edge_encoder(attn_edge_type).mean(-2).permute(0, 3, 1, 2)
+        # [n_graph, n_node, n_node, n_head] -> [n_graph, n_head, n_node, n_node]
+        edge_input = self.edge_encoder(attn_edge_type).permute(0, 3, 1, 2)
 
-        graph_attn_bias[:, :, num_virtual_tokens:, num_virtual_tokens:] = (
-            graph_attn_bias[:, :, num_virtual_tokens:, num_virtual_tokens:] + edge_input
-        )
+        graph_attn_bias[:, :, :, :] = graph_attn_bias[:, :, :, :] + edge_input
         graph_attn_bias = graph_attn_bias + attn_bias.unsqueeze(1)  # reset
 
         # node feauture + graph token
@@ -197,11 +151,13 @@ class Graphormer(pl.LightningModule):
 
         node_feature = (
             node_feature
-            + self.in_degree_encoder(in_degree)
-            + self.out_degree_encoder(out_degree)
+            + self.in_degree_encoder(in_degree.T)
+            + self.out_degree_encoder(out_degree.T)
         )
         graph_token_feature = self.graph_token.weight.unsqueeze(0).repeat(n_graph, 1, 1)
-        graph_node_feature = torch.cat([graph_token_feature, node_feature], dim=1)
+        graph_node_feature = torch.cat(
+            [graph_token_feature, node_feature.unsqueeze(0)], dim=1
+        )
 
         # transfomrer encoder
         output = self.input_dropout(graph_node_feature)
@@ -210,125 +166,40 @@ class Graphormer(pl.LightningModule):
                 output, graph_attn_bias, mask=None
             )  # TODO readd mask as adj
         output = self.final_ln(output)
-
-        # output part
-        if self.dataset_name == "PCQM4M-LSC":
-            # get whole graph rep
-            output = self.out_proj(output[:, 0, :])
-        else:
-            output = self.downstream_out_proj(output[:, 0, :])
+        output = self.downstream_out_proj(output)
         return output
 
     def training_step(self, batched_data, batch_idx):
-        if self.dataset_name == "ogbg-molpcba":
-            if not self.flag:
-                y_hat = self(batched_data).view(-1)
-                y_gt = batched_data.y.view(-1).float()
-                mask = ~torch.isnan(y_gt)
-                loss = self.loss_fn(y_hat[mask], y_gt[mask])
-            else:
-                y_gt = batched_data.y.view(-1).float()
-                mask = ~torch.isnan(y_gt)
 
-                def forward(perturb):
-                    return self(batched_data, perturb)
-
-                model_forward = (self, forward)
-                n_graph, n_node = batched_data.x.size()[:2]
-                perturb_shape = (n_graph, n_node, self.hidden_dim)
-
-                optimizer = self.optimizers()
-                optimizer.zero_grad()
-                loss, _ = flag_bounded(
-                    model_forward,
-                    perturb_shape,
-                    y_gt[mask],
-                    optimizer,
-                    batched_data.x.device,
-                    self.loss_fn,
-                    m=self.flag_m,
-                    step_size=self.flag_step_size,
-                    mag=self.flag_mag,
-                    mask=mask,
-                )
-                self.lr_schedulers().step()
-
-        elif self.dataset_name == "ogbg-molhiv":
-            if not self.flag:
-                y_hat = self(batched_data).view(-1)
-                y_gt = batched_data.y.view(-1).float()
-                loss = self.loss_fn(y_hat, y_gt)
-            else:
-                y_gt = batched_data.y.view(-1).float()
-
-                def forward(perturb):
-                    return self(batched_data, perturb)
-
-                model_forward = (self, forward)
-                n_graph, n_node = batched_data.x.size()[:2]
-                perturb_shape = (n_graph, n_node, self.hidden_dim)
-
-                optimizer = self.optimizers()
-                optimizer.zero_grad()
-                loss, _ = flag_bounded(
-                    model_forward,
-                    perturb_shape,
-                    y_gt,
-                    optimizer,
-                    batched_data.x.device,
-                    self.loss_fn,
-                    m=self.flag_m,
-                    step_size=self.flag_step_size,
-                    mag=self.flag_mag,
-                )
-                self.lr_schedulers().step()
-
-        elif self.dataset_name == "CORA":
-            y_hat = self(batched_data).view(-1)
-            y_gt = batched_data.y.view(-1)
-            train_mask = get_dataset(self.dataset_name).train_mask
-            loss = self.loss_fn(y_hat[train_mask], y_gt[train_mask])
-        else:
-            y_hat = self(batched_data).view(-1)
-            y_gt = batched_data.y.view(-1)
-            loss = self.loss_fn(y_hat, y_gt)
+        y_hat = self(batched_data)
+        y_gt = batched_data.y.view(-1)
+        train_mask = get_dataset(self.dataset_name)["dataset"].data.train_mask
+        loss = self.loss_fn(y_hat[0, 1:-3, :][train_mask], y_gt[train_mask])
         self.log("train_loss", loss, sync_dist=True)
         return loss
 
     def validation_step(self, batched_data, batch_idx):
-        if self.dataset_name in ["PCQM4M-LSC", "ZINC"]:
-            y_pred = self(batched_data).view(-1)
-            y_true = batched_data.y.view(-1)
-        elif self.dataset_name == "CORA":
-            y_hat = self(batched_data).view(-1)
-            y_gt = batched_data.y.view(-1)
-            val_mask = get_dataset(self.dataset_name).val_mask
-            loss = self.loss_fn(y_hat[val_mask], y_gt[val_mask])
-        else:
-            y_pred = self(batched_data)
-            y_true = batched_data.y
+
+        y_hat = self(batched_data)
+        y_gt = batched_data.y.view(-1)
+        val_mask = get_dataset(self.dataset_name)["dataset"].data.val_mask
+        loss = self.loss_fn(y_hat[0, 1:-3, :][val_mask], y_gt[val_mask])
         return {
-            "y_pred": y_pred,
-            "y_true": y_true,
+            "y_pred": y_hat[0, 1:-3, :][val_mask],
+            "y_true": y_gt[val_mask],
         }
 
     def validation_epoch_end(self, outputs):
         y_pred = torch.cat([i["y_pred"] for i in outputs])
         y_true = torch.cat([i["y_true"] for i in outputs])
-        if self.dataset_name == "ogbg-molpcba":
-            mask = ~torch.isnan(y_true)
-            loss = self.loss_fn(y_pred[mask], y_true[mask])
-            self.log("valid_ap", loss, sync_dist=True)
-        else:
-            input_dict = {"y_true": y_true, "y_pred": y_pred}
-            try:
-                self.log(
-                    "valid_" + self.metric,
-                    self.evaluator.eval(input_dict)[self.metric],
-                    sync_dist=True,
-                )
-            except:
-                pass
+
+        input_dict = {"y_true": y_true, "y_pred": y_pred}
+        try:
+            self.log(
+                "valid_" + self.metric, self.loss_fn(y_pred, y_true), sync_dist=True,
+            )
+        except:
+            pass
 
     def test_step(self, batched_data, batch_idx):
         if self.dataset_name in ["PCQM4M-LSC", "ZINC"]:

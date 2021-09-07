@@ -29,7 +29,7 @@ def preprocess_item(item):
 
     N = x.size(0)
 
-    x = convert_to_single_emb(x)  # For ZINC: [n_nodes, 1]
+    # x = convert_to_single_emb(x)  # For ZINC: [n_nodes, 1]
 
     # node adj matrix [N, N] bool
     adj_orig = torch.zeros([N, N], dtype=torch.bool)
@@ -47,8 +47,18 @@ def preprocess_item(item):
     shortest_path_result, path = algos.floyd_warshall(
         adj_orig.numpy()
     )  # [n_nodesxn_nodes, n_nodesxn_nodes]
-    max_dist = np.amax(shortest_path_result)
-    edge_input = algos.gen_edge_input(max_dist, path, attn_edge_type.numpy())
+    # max_dist = np.amax(shortest_path_result)
+
+    max_dist = 20
+
+    # Dummy edge input
+    edge_input = (
+        torch.zeros((attn_edge_type.shape[0], attn_edge_type.shape[1], max_dist, 1))
+        .numpy()
+        .astype(int)
+    )
+
+    # edge_input = algos.gen_edge_input(max_dist, path, attn_edge_type.numpy()) #TODO: restore
     rel_pos = torch.from_numpy((shortest_path_result)).long()
     attn_bias = torch.zeros(
         [N + num_virtual_tokens, N + num_virtual_tokens], dtype=torch.float
